@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from importlib import resources
 
@@ -8,8 +9,9 @@ from starlette.responses import RedirectResponse
 from starlette.staticfiles import StaticFiles
 
 from mediaflow_proxy.configs import settings
+from mediaflow_proxy.middleware import UIAccessControlMiddleware
 from mediaflow_proxy.routes import proxy_router, extractor_router, speedtest_router
-from mediaflow_proxy.schemas import GenerateUrlRequest
+from mediaflow_proxy.schemas import GenerateUrlRequest, GenerateMultiUrlRequest, MultiUrlRequestItem
 from mediaflow_proxy.utils.crypto_utils import EncryptionHandler, EncryptionMiddleware
 from mediaflow_proxy.utils.http_utils import encode_mediaflow_proxy_url
 
@@ -25,6 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(EncryptionMiddleware)
+app.add_middleware(UIAccessControlMiddleware)
 
 
 async def verify_api_key(api_key: str = Security(api_password_query), api_key_alt: str = Security(api_password_header)):
@@ -62,23 +65,95 @@ async def show_speedtest_page():
     return RedirectResponse(url="/speedtest.html")
 
 
-@app.post("/generate_encrypted_or_encoded_url")
-async def generate_encrypted_or_encoded_url(request: GenerateUrlRequest):
-    if "api_password" not in request.query_params:
-        request.query_params["api_password"] = request.api_password
+@app.post(
+    "/generate_encrypted_or_encoded_url",
+    description="Generate a single encoded URL",
+    response_description="Returns a single encoded URL",
+    deprecated=True,
+    tags=["url"],
+)
+async def generate_encrypted_or_encoded_url(
+    request: GenerateUrlRequest,
+):
+    """
+    Generate a single encoded URL based on the provided request.
+    """
+    return {"encoded_url": (await generate_url(request))["url"]}
+
+
+@app.post(
+    "/generate_url",
+    description="Generate a single encoded URL",
+    response_description="Returns a single encoded URL",
+    tags=["url"],
+)
+async def generate_url(request: GenerateUrlRequest):
+    """Generate a single encoded URL based on the provided request."""
+    encryption_handler = EncryptionHandler(request.api_password) if request.api_password else None
+
+    # Ensure api_password is in query_params if provided
+    query_params = request.query_params.copy()
+    if "api_password" not in query_params and request.api_password:
+        query_params["api_password"] = request.api_password
+
+    # Convert IP to string if provided
+    ip_str = str(request.ip) if request.ip else None
 
     encoded_url = encode_mediaflow_proxy_url(
-        request.mediaflow_proxy_url,
-        request.endpoint,
-        request.destination_url,
-        request.query_params,
-        request.request_headers,
-        request.response_headers,
-        EncryptionHandler(request.api_password) if request.api_password else None,
-        request.expiration,
-        str(request.ip) if request.ip else None,
+        mediaflow_proxy_url=request.mediaflow_proxy_url,
+        endpoint=request.endpoint,
+        destination_url=request.destination_url,
+        query_params=query_params,
+        request_headers=request.request_headers,
+        response_headers=request.response_headers,
+        encryption_handler=encryption_handler,
+        expiration=request.expiration,
+        ip=ip_str,
+        filename=request.filename,
     )
-    return {"encoded_url": encoded_url}
+
+    return {"url": encoded_url}
+
+
+@app.post(
+    "/generate_urls",
+    description="Generate multiple encoded URLs with shared common parameters",
+    response_description="Returns a list of encoded URLs",
+    tags=["url"],
+)
+async def generate_urls(request: GenerateMultiUrlRequest):
+    """Generate multiple encoded URLs with shared common parameters."""
+    # Set up encryption handler if password is provided
+    encryption_handler = EncryptionHandler(request.api_password) if request.api_password else None
+
+    # Convert IP to string if provided
+    ip_str = str(request.ip) if request.ip else None
+
+    async def _process_url_item(
+        url_item: MultiUrlRequestItem,
+    ) -> str:
+        """Process a single URL item with common parameters and return the encoded URL."""
+        query_params = url_item.query_params.copy()
+        if "api_password" not in query_params and request.api_password:
+            query_params["api_password"] = request.api_password
+
+        # Generate the encoded URL
+        return encode_mediaflow_proxy_url(
+            mediaflow_proxy_url=request.mediaflow_proxy_url,
+            endpoint=url_item.endpoint,
+            destination_url=url_item.destination_url,
+            query_params=query_params,
+            request_headers=url_item.request_headers,
+            response_headers=url_item.response_headers,
+            encryption_handler=encryption_handler,
+            expiration=request.expiration,
+            ip=ip_str,
+            filename=url_item.filename,
+        )
+
+    tasks = [_process_url_item(url_item) for url_item in request.urls]
+    encoded_urls = await asyncio.gather(*tasks)
+    return {"urls": encoded_urls}
 
 
 app.include_router(proxy_router, prefix="/proxy", tags=["proxy"], dependencies=[Depends(verify_api_key)])

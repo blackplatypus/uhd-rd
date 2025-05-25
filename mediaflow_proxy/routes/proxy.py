@@ -1,4 +1,5 @@
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import Request, Depends, APIRouter, Query, HTTPException
 
@@ -14,7 +15,6 @@ from mediaflow_proxy.schemas import (
     MPDSegmentParams,
     MPDPlaylistParams,
     HLSManifestParams,
-    ProxyStreamParams,
     MPDManifestParams,
 )
 from mediaflow_proxy.utils.http_utils import get_proxy_headers, ProxyRequestHeaders
@@ -45,18 +45,22 @@ async def hls_manifest_proxy(
 
 @proxy_router.head("/stream")
 @proxy_router.get("/stream")
+@proxy_router.head("/stream/{filename:path}")
+@proxy_router.get("/stream/{filename:path}")
 async def proxy_stream_endpoint(
     request: Request,
-    stream_params: Annotated[ProxyStreamParams, Query()],
     proxy_headers: Annotated[ProxyRequestHeaders, Depends(get_proxy_headers)],
+    destination: str = Query(..., description="The URL of the stream.", alias="d"),
+    filename: str | None = None,
 ):
     """
-    Proxies stream requests to the given video URL.
+    Proxify stream requests to the given video URL.
 
     Args:
         request (Request): The incoming HTTP request.
-        stream_params (ProxyStreamParams): The parameters for the stream request.
         proxy_headers (ProxyRequestHeaders): The headers to include in the request.
+        destination (str): The URL of the stream to be proxied.
+        filename (str | None): The filename to be used in the response headers.
 
     Returns:
         Response: The HTTP response with the streamed content.
@@ -66,7 +70,20 @@ async def proxy_stream_endpoint(
         # Handle invalid range requests "bytes=NaN-NaN"
         raise HTTPException(status_code=416, detail="Invalid Range Header")
     proxy_headers.request.update({"range": content_range})
-    return await proxy_stream(request.method, stream_params, proxy_headers)
+    if filename:
+        # If a filename is provided, set it in the headers using RFC 6266 format
+        try:
+            # Try to encode with latin-1 first (simple case)
+            filename.encode("latin-1")
+            content_disposition = f'attachment; filename="{filename}"'
+        except UnicodeEncodeError:
+            # For filenames with non-latin-1 characters, use RFC 6266 format with UTF-8
+            encoded_filename = quote(filename.encode("utf-8"))
+            content_disposition = f"attachment; filename*=UTF-8''{encoded_filename}"
+
+        proxy_headers.response.update({"content-disposition": content_disposition})
+
+    return await proxy_stream(request.method, destination, proxy_headers)
 
 
 @proxy_router.get("/mpd/manifest.m3u8")
